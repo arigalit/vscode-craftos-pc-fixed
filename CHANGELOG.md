@@ -2,6 +2,43 @@
 
 All notable changes to the "craftos-pc" extension will be documented in this file.
 
+## 1.2.4 (Fixed fork)
+
+First release of the maintained fork.
+
+### Remote file access
+* Fixed packets being dropped when a response arrived in several pieces (main cause of files working only "sometimes")
+* Fixed request IDs colliding in large folders; requests are now limited to 32 at a time and timeouts are longer
+* Fixed folder listing hanging forever when a request failed
+* Fixed saving files from VS Code failing
+* Fixed the file watcher returning an invalid value, which could break opening/closing the remote folder
+* The file explorer now refreshes after files are created, deleted, renamed or saved
+* File names with non-ASCII characters (e.g. Cyrillic) now work correctly (UTF-8)
+* Fixed paths using backslashes on Windows
+* Errors are now reported as proper file system errors (e.g. "file not found")
+* Pending requests are cancelled immediately when the connection closes
+* Events from an old CraftOS-PC process no longer close a newly started connection
+* Garbage data in the stream no longer breaks the connection; the parser resynchronizes
+
+### Workspace / commands
+* Closing the "connection will close" dialog no longer counts as "Yes"
+* Opening remote data from the Command Palette now closes the connection cleanly
+* Adding the same computer twice no longer shows a false "files added" message
+* Fixed an empty folder name for the primary computer
+* Added setting `craftos-pc.closeOldTerminalOnRun` (`ask` / `always` / `never`) for running a script while a terminal is already open
+* Fixed `undefined` being passed to CraftOS-PC when starting a session, and `-d ""` being passed when `dataPath` is empty
+* "Force Close Connection" now also cleans up the open windows
+
+### Terminal
+* Fixed mouse click positions on terminals that are not 51x19
+* Fixed multi-line paste leaving extra lines
+* Fixed a crash when a window that no longer exists was closed (possible cause of disconnects on PC reboot)
+* Fixed a Live Share crash on updates for unknown windows
+
+### Known limitations
+* Scroll direction is reported as 0 instead of -1 when scrolling up; this is a CraftOS-PC bug, not an extension one
+* Breakpoints may show as "unverified" until the debug adapter has started; this is handled by CraftOS-PC itself
+
 ## 1.2.3
 
 * Added a new very prominent button to open files

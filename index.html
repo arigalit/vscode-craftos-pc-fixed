@@ -281,14 +281,14 @@
                 }
             }
             function getx(x) {
-                if (x < 4) return 1;
-                else if (x >= 616) return lastMode == 0 ? 51 : 306;
-                else return Math.floor((x - 4) / (lastMode == 0 ? 12 : 2) + 1);
+                const cells = lastMode == 0 ? size.width : size.width * 6;
+                const v = Math.floor((x - 4) / (lastMode == 0 ? 12 : 2)) + 1;
+                return Math.max(1, Math.min(cells, v));
             }
             function gety(y) {
-                if (y < 4) return 1;
-                else if (y >= 346) return lastMode == 0 ? 19 : 171;
-                else return Math.floor((y - 4) / (lastMode == 0 ? 18 : 2) + 1);
+                const cells = lastMode == 0 ? size.height : size.height * 9;
+                const v = Math.floor((y - 4) / (lastMode == 0 ? 18 : 2)) + 1;
+                return Math.max(1, Math.min(cells, v));
             }
             function pack8(n) {return ("0" + n.toString(16)).slice(-2);}
             function pack16(n) {return pack8(n & 0xFF) + pack8((n >> 8) & 0xFF);}
@@ -353,7 +353,7 @@
                 if (typeof data === "string") {
                     e.stopPropagation();
                     e.preventDefault();
-                    sendPacket(3, "01" + packstr("paste") + "03" + packstr(data.replace(/\n.*$/, "")));
+                    sendPacket(3, "01" + packstr("paste") + "03" + packstr(data.replace(/[\r\n][\s\S]*$/, "")));
                 }
                 document.getElementById("pastebox").innerHTML = "";
             }

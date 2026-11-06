@@ -60,6 +60,14 @@ function bufferstream(str) {
         return this.str.readUInt8(this.pos++);
     };
     retval.putback = function() {this.pos--;}
+    // Reads a NUL-terminated UTF-8 string (throws if the terminator is missing)
+    retval.readCString = function() {
+        const end = this.str.indexOf(0, this.pos);
+        if (end === -1) throw new RangeError("Unterminated string in packet");
+        const r = this.str.toString("utf8", this.pos, end);
+        this.pos = end + 1;
+        return r;
+    }
     return retval;
 }
 
@@ -158,7 +166,22 @@ function getExecutable() {
     return null;
 }
 
+function rejectPendingRequests(err) {
+    const queued = dataRequestQueue;
+    dataRequestQueue = [];
+    for (const req of queued) req.reject(err);
+    for (const id of Object.keys(dataRequestCallbacks)) {
+        const cb = dataRequestCallbacks[id];
+        try { cb(null, err); } catch (e) {}
+    }
+    dataRequestCallbacks = {};
+    dataRequestInflight = 0;
+}
+
 function closeAllWindows() {
+    rejectPendingRequests(vscode.FileSystemError.Unavailable("Computer connection closed"));
+    data_continuation = null;
+    supportsFilesystem = false;
     for (let k in windows) if (windows[k].panel !== undefined) windows[k].panel.dispose();
     windows = {};
     computer_provider._onDidChangeTreeData.fire(null);
@@ -166,50 +189,108 @@ function closeAllWindows() {
     if (vslsServer !== null) vslsServer.notify("windows", {});
 }
 
+const MAX_INFLIGHT_REQUESTS = 32;
+var dataRequestQueue = [];
+var dataRequestInflight = 0;
+
+function allocRequestID() {
+    // Request IDs are only 8 bits wide: never hand out one that is still waiting for an answer.
+    for (let i = 0; i < 256; i++) {
+        const id = nextDataRequestID;
+        nextDataRequestID = (nextDataRequestID + 1) & 0xFF;
+        if (!dataRequestCallbacks[id]) return id;
+    }
+    return -1;
+}
+
+function pumpDataRequests() {
+    while (dataRequestInflight < MAX_INFLIGHT_REQUESTS && dataRequestQueue.length > 0) {
+        const req = dataRequestQueue.shift();
+        if (process_connection === null) {
+            req.reject(vscode.FileSystemError.Unavailable("Computer connection not open yet"));
+            continue;
+        }
+        sendDataRequest(req);
+    }
+}
+
 function queueDataRequest(id, type, path, path2) {
-    if (process_connection === null) return new Promise((resolve, reject) => reject(new Error("Path does not exist")));
+    if (process_connection === null) return Promise.reject(vscode.FileSystemError.Unavailable("Computer connection not open yet"));
+    return new Promise((resolve, reject) => {
+        dataRequestQueue.push({id, type, path, path2, resolve, reject});
+        pumpDataRequests();
+    });
+}
+
+function sendDataRequest(req) {
+    let {id, type, path, path2} = req;
+    const reqid = allocRequestID();
+    if (reqid < 0) {
+        req.reject(vscode.FileSystemError.Unavailable("Too many pending requests"));
+        return;
+    }
     let filedata = undefined;
     if ((type & 0xF1) === 0x11) {
         filedata = path2;
         path2 = undefined;
     }
-    const pathbuf = Buffer.from(path, "latin1");
-    const path2buf = (typeof path2 === "string" ? Buffer.from(path2, "latin1") : null);
-    const data = Buffer.alloc(5 + pathbuf.length + (typeof path2 === "string" ? path2buf.length + 1 : 0));
+    const pathbuf = Buffer.from(path, "utf8");
+    const path2buf = (typeof path2 === "string" ? Buffer.from(path2, "utf8") : null);
+    const data = Buffer.alloc(5 + pathbuf.length + (path2buf !== null ? path2buf.length + 1 : 0));
     data[0] = 7;
     data[1] = id;
     data[2] = type;
-    data[3] = nextDataRequestID;
-    nextDataRequestID = (nextDataRequestID + 1) & 0xFF;
+    data[3] = reqid;
     pathbuf.copy(data, 4);
-    if (typeof path2 === "string") path2buf.copy(data, 5 + pathbuf.length);
+    if (path2buf !== null) path2buf.copy(data, 5 + pathbuf.length);
     const b64 = data.toString('base64');
     const packet = "!CPC" + ("000" + b64.length.toString(16)).slice(-4) + b64 + ("0000000" + crc32(useBinaryChecksum ? data.toString("binary") : b64).toString(16)).slice(-8) + "\n";
-    process_connection.stdin.write(packet, 'utf8');
-    if (typeof filedata !== "undefined") {
-        const data2 = Buffer.alloc(8 + filedata.length);
-        data2[0] = 9;
-        data2[1] = id;
-        data2[2] = 0;
-        data2[3] = data[3];
-        data2.writeInt32LE(filedata.length, 4);
-        filedata.copy(data2, 8);
-        const b642 = data2.toString('base64');
-        const packet2 = (b642.length > 65535 ? "!CPD" + ("00000000000" + b642.length.toString(16)).slice(-12) : "!CPC" + ("000" + b642.length.toString(16)).slice(-4)) + b642 + ("0000000" + crc32(useBinaryChecksum ? data2.toString("binary") : b642).toString(16)).slice(-8) + "\n";
-        process_connection.stdin.write(packet2, 'utf8');
-    }
-    return new Promise((resolve, reject) => {
-        let tid = setTimeout(() => {
-            delete dataRequestCallbacks[data[3]];
-            log.appendLine("Could not get info for " + path + " (request " + data[3] + ")");
-            reject(new Error("Timeout"));
-        }, 3000);
-        dataRequestCallbacks[data[3]] = (data, err) => {
-            clearTimeout(tid);
-            if (!err) resolve(data);
-            else reject(err);
+
+    let done = false;
+    dataRequestInflight++;
+    const timeoutMs = (type === 20 || type === 21) ? 30000 : 10000;
+    const finish = () => {
+        if (done) return false;
+        done = true;
+        clearTimeout(tid);
+        delete dataRequestCallbacks[reqid];
+        dataRequestInflight = Math.max(0, dataRequestInflight - 1);
+        return true;
+    };
+    const tid = setTimeout(() => {
+        if (!finish()) return;
+        log.appendLine("Could not get info for " + path + " (request " + reqid + ")");
+        req.reject(vscode.FileSystemError.Unavailable("Timed out waiting for CraftOS-PC to answer (" + path + ")"));
+        pumpDataRequests();
+    }, timeoutMs);
+    dataRequestCallbacks[reqid] = (result, err) => {
+        if (!finish()) return;
+        if (!err) req.resolve(result);
+        else req.reject(err);
+        pumpDataRequests();
+    };
+
+    try {
+        process_connection.stdin.write(packet, 'utf8');
+        if (typeof filedata !== "undefined") {
+            const filebuf = Buffer.isBuffer(filedata) ? filedata : Buffer.from(filedata);
+            const data2 = Buffer.alloc(8 + filebuf.length);
+            data2[0] = 9;
+            data2[1] = id;
+            data2[2] = 0;
+            data2[3] = reqid;
+            data2.writeInt32LE(filebuf.length, 4);
+            filebuf.copy(data2, 8);
+            const b642 = data2.toString('base64');
+            const packet2 = (b642.length > 65535 ? "!CPD" + ("00000000000" + b642.length.toString(16)).slice(-12) : "!CPC" + ("000" + b642.length.toString(16)).slice(-4)) + b642 + ("0000000" + crc32(useBinaryChecksum ? data2.toString("binary") : b642).toString(16)).slice(-8) + "\n";
+            process_connection.stdin.write(packet2, 'utf8');
         }
-    });
+    } catch (e) {
+        if (finish()) {
+            req.reject(vscode.FileSystemError.Unavailable("Failed to send request: " + (e && e.message)));
+            pumpDataRequests();
+        }
+    }
 }
 
 function checkVersion(silent) {
@@ -245,120 +326,130 @@ class RawFileSystemProvider {
         this._onDidChangeFile = new vscode.EventEmitter()
         this.onDidChangeFile = this._onDidChangeFile.event
     }
+    _check() {
+        if (process_connection === null) throw vscode.FileSystemError.Unavailable("Computer connection not open yet");
+        if (!supportsFilesystem) throw vscode.FileSystemError.Unavailable("Connected computer doesn't support filesystems");
+    }
+    /** Turns protocol errors into proper FileSystemErrors so VS Code can show sensible messages. */
+    _mapError(err, uri) {
+        if (err instanceof vscode.FileSystemError) return err;
+        const msg = (err && err.message) ? String(err.message) : String(err);
+        if (/not exist|not found|no such|does not exist/i.test(msg)) return vscode.FileSystemError.FileNotFound(uri);
+        if (/already exists|file exists/i.test(msg)) return vscode.FileSystemError.FileExists(uri);
+        if (/read.?only|permission|access denied/i.test(msg)) return vscode.FileSystemError.NoPermissions(uri);
+        return new vscode.FileSystemError(msg);
+    }
+    _request(uri, type, path, path2) {
+        return queueDataRequest(parseInt(uri.authority), type, path, path2).catch(err => { throw this._mapError(err, uri); });
+    }
+    _fire(events) {
+        try { this._onDidChangeFile.fire(events); } catch (e) { log.appendLine("Failed to fire file event: " + e); }
+    }
     /**
      * @param {vscode.Uri} source
      * @param {vscode.Uri} destination
      * @param {{overwrite: boolean}} options
      */
-    copy(source, destination, options) {
-        if (process_connection === null) throw vscode.FileSystemError.Unavailable("Computer connection not open yet");
-        if (!supportsFilesystem) throw vscode.FileSystemError.Unavailable("Connected computer doesn't support filesystems");
+    async copy(source, destination, options) {
+        this._check();
         if (source.authority !== destination.authority) throw vscode.FileSystemError.Unavailable("Cannot move across computers");
-        return queueDataRequest(parseInt(source.authority), 12, source.path, destination.path);
+        await this._request(source, 12, source.path, destination.path);
+        this._fire([{type: vscode.FileChangeType.Created, uri: destination}]);
     }
     /**
      * @param {vscode.Uri} uri 
      */
-    createDirectory(uri) {
-        if (process_connection === null) throw vscode.FileSystemError.Unavailable("Computer connection not open yet");
-        if (!supportsFilesystem) throw vscode.FileSystemError.Unavailable("Connected computer doesn't support filesystems");
-        return queueDataRequest(parseInt(uri.authority), 10, uri.path);
+    async createDirectory(uri) {
+        this._check();
+        await this._request(uri, 10, uri.path);
+        this._fire([{type: vscode.FileChangeType.Created, uri: uri}]);
     }
     /**
      * @param {vscode.Uri} uri 
      * @param {{recursive: boolean}} options
      */
-    delete(uri, options) {
+    async delete(uri, options) {
         // Warning: ignores options.recursive (always true)
-        if (process_connection === null) throw vscode.FileSystemError.Unavailable("Computer connection not open yet");
-        if (!supportsFilesystem) throw vscode.FileSystemError.Unavailable("Connected computer doesn't support filesystems");
-        return queueDataRequest(parseInt(uri.authority), 11, uri.path);
+        this._check();
+        await this._request(uri, 11, uri.path);
+        this._fire([{type: vscode.FileChangeType.Deleted, uri: uri}]);
     }
     /**
      * @param {vscode.Uri} uri 
      */
-    readDirectory(uri) {
-        if (process_connection === null) throw vscode.FileSystemError.Unavailable("Computer connection not open yet");
-        if (!supportsFilesystem) throw vscode.FileSystemError.Unavailable("Connected computer doesn't support filesystems");
-        return new Promise(resolve => {
-            queueDataRequest(parseInt(uri.authority), 7, uri.path).then(files => {
-                let arr = [];
-                let promises = [];
-                for (let f of files) {
-                    promises.push(new Promise(resolve => queueDataRequest(parseInt(uri.authority), 1, path.join(uri.path, f)).then(isDir => {
-                        arr.push([f, isDir ? vscode.FileType.Directory : vscode.FileType.File]);
-                        resolve();
-                    }).catch(() => {
-                        arr.push([f, vscode.FileType.Unknown]);
-                        resolve();
-                    })));
-                }
-                return Promise.all(promises).then(() => {
-                    arr.sort((a, b) => {
-                        if (a[1] == vscode.FileType.File && b[1] == vscode.FileType.Directory) return 1;
-                        else if (b[1] == vscode.FileType.File && a[1] == vscode.FileType.Directory) return -1;
-                        else return a[0].localeCompare(b[0]);
-                    });
-                    resolve(arr);
-                });
-            });
-        });
+    async readDirectory(uri) {
+        this._check();
+        const files = await this._request(uri, 7, uri.path);
+        const arr = await Promise.all(files.map(f =>
+            queueDataRequest(parseInt(uri.authority), 1, path.posix.join(uri.path, f))
+                .then(isDir => [f, isDir ? vscode.FileType.Directory : vscode.FileType.File])
+                .catch(() => [f, vscode.FileType.Unknown])
+        ));
+        const rank = t => t === vscode.FileType.Directory ? 0 : 1;
+        arr.sort((a, b) => rank(a[1]) - rank(b[1]) || a[0].localeCompare(b[0]));
+        return arr;
     }
     /**
      * @param {vscode.Uri} uri 
      */
-    readFile(uri) {
-        if (process_connection === null) throw vscode.FileSystemError.Unavailable("Computer connection not open yet");
-        if (!supportsFilesystem) throw vscode.FileSystemError.Unavailable("Connected computer doesn't support filesystems");
-        return queueDataRequest(parseInt(uri.authority), 20, uri.path).then(data => Uint8Array.from(data));
+    async readFile(uri) {
+        this._check();
+        const data = await this._request(uri, 20, uri.path);
+        return data ? Uint8Array.from(data) : new Uint8Array(0);
     }
     /**
      * @param {vscode.Uri} oldUri 
      * @param {vscode.Uri} newUri 
      * @param {{overwrite: boolean}} options 
      */
-    rename(oldUri, newUri, options) {
+    async rename(oldUri, newUri, options) {
         // Warning: ignores overwrite (always false)
-        if (process_connection === null) throw vscode.FileSystemError.Unavailable("Computer connection not open yet");
-        if (!supportsFilesystem) throw vscode.FileSystemError.Unavailable("Connected computer doesn't support filesystems");
+        this._check();
         if (oldUri.authority !== newUri.authority) throw vscode.FileSystemError.Unavailable("Cannot move across computers");
-        return queueDataRequest(parseInt(oldUri.authority), 13, oldUri.path, newUri.path);
+        await this._request(oldUri, 13, oldUri.path, newUri.path);
+        this._fire([{type: vscode.FileChangeType.Deleted, uri: oldUri}, {type: vscode.FileChangeType.Created, uri: newUri}]);
     }
     /**
      * @param {vscode.Uri} uri 
      */
-    stat(uri) {
-        if (process_connection === null) throw vscode.FileSystemError.Unavailable("Computer connection not open yet");
-        if (!supportsFilesystem) throw vscode.FileSystemError.Unavailable("Connected computer doesn't support filesystems");
-        return queueDataRequest(parseInt(uri.authority), 8, uri.path).then(attributes => {
-            if (attributes === null) throw vscode.FileSystemError.FileNotFound(uri);
-            return {
-                ctime: attributes.created.getTime(),
-                mtime: attributes.modified.getTime(),
-                size: attributes.size,
-                type: attributes.isDir ? vscode.FileType.Directory : vscode.FileType.File
-            }
-        });
+    async stat(uri) {
+        this._check();
+        const attributes = await this._request(uri, 8, uri.path);
+        if (attributes === null || attributes === undefined) throw vscode.FileSystemError.FileNotFound(uri);
+        const result = {
+            ctime: attributes.created.getTime(),
+            mtime: attributes.modified.getTime(),
+            size: attributes.size,
+            type: attributes.isDir ? vscode.FileType.Directory : vscode.FileType.File
+        };
+        if (attributes.isReadOnly && vscode.FilePermission) result.permissions = vscode.FilePermission.Readonly;
+        return result;
     }
     /**
      * @param {vscode.Uri} uri 
      * @param {{excludes: string[], recursive: boolean}} options
      */
     watch(uri, options) {
-        // unimplemented
-        if (process_connection === null) throw vscode.FileSystemError.Unavailable("Computer connection not open yet");
-        if (!supportsFilesystem) throw vscode.FileSystemError.Unavailable("Connected computer doesn't support filesystems");
-        return null;
+        // Change notifications are not implemented, but VS Code expects a Disposable here.
+        // This must never throw, even if the connection isn't open yet (workspace restore).
+        return new vscode.Disposable(() => {});
     }
     /**
      * @param {vscode.Uri} uri 
      * @param {Uint8Array} content
      * @param {{create: boolean, overwrite: boolean}} options
      */
-    writeFile(uri, content, options) {
-        if (process_connection === null) throw vscode.FileSystemError.Unavailable("Computer connection not open yet");
-        if (!supportsFilesystem) throw vscode.FileSystemError.Unavailable("Connected computer doesn't support filesystems");
-        return queueDataRequest(parseInt(uri.authority), 21, uri.path, content);
+    async writeFile(uri, content, options) {
+        this._check();
+        let exists = true;
+        if (!(options && options.create && options.overwrite)) {
+            const attributes = await this._request(uri, 8, uri.path);
+            exists = attributes !== null && attributes !== undefined;
+            if (!exists && !options.create) throw vscode.FileSystemError.FileNotFound(uri);
+            if (exists && options.create && !options.overwrite) throw vscode.FileSystemError.FileExists(uri);
+        }
+        await this._request(uri, 21, uri.path, Buffer.from(content));
+        this._fire([{type: exists ? vscode.FileChangeType.Changed : vscode.FileChangeType.Created, uri: uri}]);
     }
 }
 
@@ -382,10 +473,9 @@ const debugAdapterFactory = {
                 return null;
             }
             const dir = vscode.workspace.getConfiguration("craftos-pc").get("dataPath");
-            let args = vscode.workspace.getConfiguration("craftos-pc").get("additionalArguments");
-            if (args !== null) {args = args.split(' '); args.push("--exec"); args.push("periphemu.create(0,'debug_adapter')")}
-            else args = ["--exec", "periphemu.create(0,'debug_adapter')"];
-            if (dir !== null) args.splice(0, 0, "-d", dir);
+            let args = splitArgs(vscode.workspace.getConfiguration("craftos-pc").get("additionalArguments"));
+            args.push("--exec", "periphemu.create(0,'debug_adapter')");
+            if (dir) args.splice(0, 0, "-d", dir);
             return new vscode.DebugAdapterExecutable(exe_path, args);
         } else if (session.configuration.request === "attach") {
             return new vscode.DebugAdapterServer(session.configuration.port || 12100, session.configuration.host);
@@ -397,38 +487,65 @@ const debugAdapterFactory = {
  * @param {Buffer} chunk data
  */
 function processDataChunk(chunk) {
-    if (typeof chunk === "string") chunk = new Buffer(chunk, "utf8");
+    if (typeof chunk === "string") chunk = Buffer.from(chunk, "utf8");
+    else if (!Buffer.isBuffer(chunk)) chunk = Buffer.from(chunk);
     if (data_continuation !== null) {
         chunk = Buffer.concat([data_continuation, chunk]);
         data_continuation = null;
     }
     while (chunk.length > 0) {
-        let off;
-        if (chunk.subarray(0, 4).toString() === "!CPC") off = 8;
-        else if (chunk.subarray(0, 4).toString() === "!CPD" && isVersion11) off = 16;
-        else {
-            log.appendLine("Invalid message");
-            return;
+        // skip whitespace between messages
+        if (chunk[0] === 10 || chunk[0] === 13 || chunk[0] === 32 || chunk[0] === 9) {
+            chunk = chunk.subarray(1);
+            continue;
         }
-        const size = parseInt(chunk.subarray(4, off).toString(), 16);
-        if (size > chunk.length + 9) {
+        if (chunk.length < 4) {
             data_continuation = chunk;
             return;
         }
+        const header = chunk.subarray(0, 4).toString();
+        let off;
+        if (header === "!CPC") off = 8;
+        else if (header === "!CPD" && isVersion11) off = 16;
+        else {
+            // Not a packet: resynchronize on the next packet header instead of throwing everything away.
+            log.appendLine("Invalid message, resynchronizing");
+            const next = chunk.indexOf("!CP", 1);
+            if (next === -1) return;
+            chunk = chunk.subarray(next);
+            continue;
+        }
+        if (chunk.length < off) {
+            data_continuation = chunk;
+            return;
+        }
+        const size = parseInt(chunk.subarray(4, off).toString(), 16);
+        if (isNaN(size)) {
+            log.appendLine("Invalid packet size, resynchronizing");
+            chunk = chunk.subarray(4);
+            continue;
+        }
+        const total = off + size + 8; // header + payload + checksum
+        if (chunk.length < total) {
+            // Incomplete packet: wait for the rest of it
+            data_continuation = chunk;
+            return;
+        }
+        const advance = () => { chunk = chunk.subarray(total); };
+        try {
         const data = Buffer.from(chunk.subarray(off, size + off).toString(), 'base64');
         const good_checksum = parseInt(chunk.subarray(size + off, size + off + 8).toString(), 16);
         const data_checksum = crc32(useBinaryChecksum ? data.toString("binary") : chunk.subarray(off, size + off).toString());
         if (good_checksum !== data_checksum) {
             log.appendLine("Bad checksum: expected " + good_checksum.toString(16) + ", got " + data_checksum.toString(16));
-            chunk = chunk.subarray(size + 16);
-            while (String.fromCharCode(chunk[0]).match(/\s/)) chunk = chunk.subarray(1);
+            advance();
             continue;
         }
         let term = {}
         const stream = bufferstream(data);
         const type = stream.get();
         const id = stream.get();
-        if (!gotMessage && type == 4) process_connection.stdin.write("!CPC0008BgADAA==498C93D2\n"); // 0x0003
+        if (!gotMessage && type == 4 && process_connection) process_connection.stdin.write("!CPC0008BgADAA==498C93D2\n"); // 0x0003
         gotMessage = true;
         let winid = null;
         if (type === 0) {
@@ -515,20 +632,18 @@ function processDataChunk(chunk) {
                 closeAllWindows();
                 return;
             } else if (type2 === 1) {
-                if (windows[id].panel !== undefined) windows[id].panel.dispose();
+                if (windows[id] && windows[id].panel !== undefined) windows[id].panel.dispose();
                 delete windows[id];
                 computer_provider._onDidChangeTreeData.fire(null);
                 monitor_provider._onDidChangeTreeData.fire(null);
                 if (vslsServer !== null) vslsServer.notify("windows", windows);
-                chunk = chunk.subarray(size + 16);
-                while (String.fromCharCode(chunk[0]).match(/\s/)) chunk = chunk.subarray(1);
+                advance();
                 continue;
             } else if (type2 === 0) {
                 winid = stream.get();
                 term.width = stream.readUInt16();
                 term.height = stream.readUInt16();
-                term.title = "";
-                for (let c = stream.get(); c !== 0; c = stream.get()) term.title += String.fromCharCode(c);
+                term.title = stream.readCString();
                 if (windows[id] !== undefined) {
                     windows[id].isMonitor = typeof term.title === "string" && term.title.indexOf("Monitor") !== -1;
                     if (winid > 0) {
@@ -541,10 +656,8 @@ function processDataChunk(chunk) {
             }
         } else if (type === 5) {
             const flags = stream.readUInt32();
-            let title = "";
-            for (let c = stream.get(); c !== 0; c = stream.get()) title += String.fromCharCode(c);
-            let message = "";
-            for (let c = stream.get(); c !== 0; c = stream.get()) message += String.fromCharCode(c);
+            let title = stream.readCString();
+            let message = stream.readCString();
             switch (flags) {
                 case 0x10: vscode.window.showErrorMessage("CraftOS-PC: " + title + ": " + message); break;
                 case 0x20: vscode.window.showWarningMessage("CraftOS-PC: " + title + ": " + message); break;
@@ -562,8 +675,7 @@ function processDataChunk(chunk) {
             const reqid = stream.get();
             if (!dataRequestCallbacks[reqid]) {
                 log.appendLine("Got stray response for request ID " + reqid + ", ignoring.");
-                chunk = chunk.subarray(size + 16);
-                while (String.fromCharCode(chunk[0]).match(/\s/)) chunk = chunk.subarray(1);
+                advance();
                 continue;
             }
             switch (reqtype) {
@@ -579,8 +691,7 @@ function processDataChunk(chunk) {
                     else dataRequestCallbacks[reqid](size);
                     break;
                 } case 4: {
-                    let str = "";
-                    for (let c = stream.get(); c !== 0; c = stream.get()) str += String.fromCharCode(c);
+                    let str = stream.readCString();
                     if (str !== "") dataRequestCallbacks[reqid](str);
                     else dataRequestCallbacks[reqid](null, new Error("Operation failed"));
                     break;
@@ -590,8 +701,7 @@ function processDataChunk(chunk) {
                     else {
                         let arr = [];
                         for (let i = 0; i < size; i++) {
-                            arr[i] = "";
-                            for (let c = stream.get(); c !== 0; c = stream.get()) arr[i] += String.fromCharCode(c);
+                            arr[i] = stream.readCString();
                         }
                         dataRequestCallbacks[reqid](arr);
                     }
@@ -611,8 +721,7 @@ function processDataChunk(chunk) {
                 } case 10: case 11: case 12: case 13:
                 case 16: case 17: case 18: case 19:
                 case 20: case 21: case 22: case 23: {
-                    let str = "";
-                    for (let c = stream.get(); c !== 0; c = stream.get()) str += String.fromCharCode(c);
+                    let str = stream.readCString();
                     if (str === "") dataRequestCallbacks[reqid]();
                     else dataRequestCallbacks[reqid](null, new Error(str));
                     break;
@@ -624,8 +733,7 @@ function processDataChunk(chunk) {
             const reqid = stream.get();
             if (!dataRequestCallbacks[reqid]) {
                 log.appendLine("Got stray data response for request ID " + reqid + ", ignoring.");
-                chunk = chunk.subarray(size + 16);
-                while (String.fromCharCode(chunk[0]).match(/\s/)) chunk = chunk.subarray(1);
+                advance();
                 continue;
             }
             const size = stream.readUInt32();
@@ -660,9 +768,49 @@ function processDataChunk(chunk) {
             computer_provider._onDidChangeTreeData.fire(null);
             monitor_provider._onDidChangeTreeData.fire(null);
         }
-        chunk = chunk.subarray(size + off + 8);
-        while (String.fromCharCode(chunk[0]).match(/\s/)) chunk = chunk.subarray(1);
+        advance();
+        } catch (e) {
+            log.appendLine("Error while processing packet: " + (e && e.stack || e));
+            advance();
+        }
     }
+}
+
+const QUIT_PACKET = () => useBinaryChecksum ? "!CPC000CBAACAAAAAAAA2C7A548B\n" : "!CPC000CBAACAAAAAAAA3AB9B910\n";
+
+function splitArgs(str) {
+    return (typeof str === "string" ? str : "").split(/\s+/).filter(a => a.length > 0);
+}
+
+function resetConnectionState() {
+    gotMessage = false;
+    data_continuation = null;
+    nextDataRequestID = 0;
+    dataRequestCallbacks = {};
+    dataRequestQueue = [];
+    dataRequestInflight = 0;
+    isVersion11 = false;
+    useBinaryChecksum = false;
+    supportsFilesystem = false;
+}
+
+/** Closes the current connection (if any) and forgets about it right away. */
+function closeConnection() {
+    const conn = process_connection;
+    if (conn === null) return;
+    process_connection = null; // detach first so late events from the old connection are ignored
+    try {
+        if (conn.connected) {
+            conn.stdin.write(QUIT_PACKET(), "utf8");
+            conn.disconnect();
+        } else {
+            try { conn.stdin.write(QUIT_PACKET(), "utf8"); } catch (e) {}
+            conn.kill(SIGINT);
+        }
+    } catch (e) {
+        log.appendLine("Error while closing connection: " + e);
+    }
+    closeAllWindows();
 }
 
 function connectToProcess(extra_args) {
@@ -675,12 +823,12 @@ function connectToProcess(extra_args) {
     let process_options = {
         windowsHide: true
     };
-    let args = vscode.workspace.getConfiguration("craftos-pc").get("additionalArguments");
-    if (args !== null) {args = args.split(' '); args.push("--raw");}
-    else args = ["--raw"];
-    if (dir !== null) args.splice(-1, 0, "-d", dir);
-    if (extra_args !== null) args = args.concat(extra_args);
+    let args = splitArgs(vscode.workspace.getConfiguration("craftos-pc").get("additionalArguments"));
+    args.push("--raw");
+    if (dir) args.splice(-1, 0, "-d", dir);
+    if (Array.isArray(extra_args)) args = args.concat(extra_args);
     log.appendLine("Running: " + exe_path + " " + args.join(" "));
+    resetConnectionState();
     try {
         process_connection = child_process.spawn(exe_path, args, process_options);
     } catch (e) {
@@ -688,65 +836,74 @@ function connectToProcess(extra_args) {
         log.appendLine(e);
         return;
     }
-    process_connection.on("error", () => {
+    // Events from a process we already replaced/closed must not tear down the new connection.
+    const conn = process_connection;
+    const isCurrent = () => process_connection === conn;
+    conn.on("error", () => {
+        if (!isCurrent()) return;
         vscode.window.showErrorMessage("The CraftOS-PC worker process could not be launched. Check the path to the executable in the settings.");
         process_connection = null;
         closeAllWindows();
     });
-    process_connection.on("exit", code => {
+    conn.on("exit", code => {
+        if (!isCurrent()) return;
         vscode.window.showInformationMessage(`The CraftOS-PC worker process exited with code ${code}.`)
         process_connection = null;
         closeAllWindows();
     });
-    process_connection.on("disconnect", () => {
+    conn.on("disconnect", () => {
+        if (!isCurrent()) return;
         vscode.window.showErrorMessage(`The CraftOS-PC worker process was disconnected from the window.`)
         process_connection = null;
         closeAllWindows();
     });
-    process_connection.on("close", () => {
+    conn.on("close", () => {
+        if (!isCurrent()) return;
         //vscode.window.showInformationMessage(`The CraftOS-PC worker process closed all IO streams with code ${code}.`)
         process_connection = null;
         closeAllWindows();
     });
-    process_connection.stdout.on("data", processDataChunk);
-    process_connection.stderr.on("data", data => {
+    conn.stdout.on("data", data => { if (isCurrent()) processDataChunk(data); });
+    conn.stderr.on("data", data => {
         log.appendLine(data.toString());
     });
+    conn.stdin.on("error", e => log.appendLine("stdin error: " + e));
     //process_connection.stdin.write("!CPC0008BgACAA==FBAC4FC2\n"); // 0x0002
     process_connection.stdin.write("!CPC0008BgADAA==498C93D2\n"); // 0x0003
     //process_connection.stdin.write("!CPC0008BgAGAA==0E2CE902\n"); // 0x0006
     //process_connection.stdin.write("!CPC0008BgAHAA==8C7C7ED3\n"); // 0x0007
     vscode.window.showInformationMessage("A new CraftOS-PC worker process has been started.");
     openPanel(0, true);
-    gotMessage = false;
-    data_continuation = null;
-    nextDataRequestID = 0;
-    dataRequestCallbacks = {};
-    isVersion11 = false;
-    useBinaryChecksum = false;
-    supportsFilesystem = false;
 }
 
 function connectToWebSocket(url) {
     if (process_connection !== null || url === undefined) return true;
+    resetConnectionState();
     const socket = new WebSocket(url);
     // We insert a small shim here so we don't have to rewrite the other code.
     process_connection = {
         connected: socket.readyState == WebSocket.OPEN,
         disconnect: () => socket.close(),
         kill: () => socket.close(),
-        stdin: {write: data => {for (let i = 0; i < data.length; i += 65530) socket.send(data.substring(i, Math.min(i + 65530, data.length)))}}
+        stdin: {write: data => {
+            if (socket.readyState !== WebSocket.OPEN) return;
+            for (let i = 0; i < data.length; i += 65530) socket.send(data.substring(i, Math.min(i + 65530, data.length)));
+        }}
     };
+    const conn = process_connection;
+    const isCurrent = () => process_connection === conn;
     socket.on("open", () => {
         //socket.send("!CPC0008BgACAA==FBAC4FC2\n"); // 0x0002
         //socket.send("!CPC0008BgADAA==498C93D2\n"); // 0x0003
         //socket.send("!CPC0008BgAGAA==0E2CE902\n"); // 0x0006
         socket.send("!CPC0008BgAHAA==8C7C7ED3\n"); // 0x0007
         vscode.window.showInformationMessage("Successfully connected to the WebSocket server.");
+        if (!isCurrent()) return;
         process_connection.connected = true;
         openPanel(0, true);
     });
     socket.on("error", e => {
+        if (!isCurrent()) return;
         if (e.message.match("certificate has expired"))
             vscode.window.showErrorMessage("A bug in VS Code is causing the connection to fail. Please go to https://www.craftos-pc.cc/docs/remote#certificate-has-expired-error to fix it.", "Open Page", "OK").then(res => {
                 if (res === "OK") return;
@@ -757,18 +914,12 @@ function connectToWebSocket(url) {
         closeAllWindows();
     });
     socket.on("close", () => {
+        if (!isCurrent()) return;
         vscode.window.showInformationMessage("Disconnected from the WebSocket server.");
         process_connection = null;
         closeAllWindows();
     });
-    socket.on("message", processDataChunk);
-    gotMessage = false;
-    data_continuation = null;
-    nextDataRequestID = 0;
-    dataRequestCallbacks = {};
-    isVersion11 = false;
-    useBinaryChecksum = false;
-    supportsFilesystem = false;
+    socket.on("message", data => { if (isCurrent()) processDataChunk(data); });
 }
 
 function openPanel(id, force) {
@@ -839,6 +990,19 @@ function openPanel(id, force) {
 /**
  * @param {vscode.ExtensionContext} context
  */
+/**
+ * Adds the remote file system of a window as a workspace folder.
+ * @returns {true|false|"exists"}
+ */
+function addRemoteFolder(id, title) {
+    const clean = t => (typeof t === "string" ? t : "").replace(/^.*: */, "");
+    const name = clean(title) || clean(windows[id] && windows[id].term && windows[id].term.title) || ("Computer " + id);
+    const uri = vscode.Uri.parse(`craftos-pc://${id}/`);
+    const folders = vscode.workspace.workspaceFolders || [];
+    if (folders.some(f => f.uri.toString() === uri.toString())) return "exists";
+    return vscode.workspace.updateWorkspaceFolders(folders.length, null, {name: name, uri: uri});
+}
+
 function activate(context) {
 
     log.appendLine("The CraftOS-PC extension is now active.");
@@ -953,37 +1117,39 @@ function activate(context) {
         }
     }));
 
-    context.subscriptions.push(vscode.commands.registerCommand('craftos-pc.open-remote-data', obj => {
+    context.subscriptions.push(vscode.commands.registerCommand('craftos-pc.open-remote-data', async obj => {
         if (process_connection === null) {
             vscode.window.showErrorMessage("Please open CraftOS-PC before using this command.");
             return;
         } else if (!supportsFilesystem) {
             vscode.window.showErrorMessage("This connection does not support file system access.");
             return;
-        } else if (!vscode.workspace.workspaceFile) {
-            vscode.window.showWarningMessage("Due to technical limitations, opening the computer data will cause the connection to close. Please restart the connection after running this. Are you sure you want to continue?", "No", "Yes").then(opt => {
-                if (opt === "No") return;
-                // haha code duplication goes brrrrr
-                if (typeof obj === "object") {
-                    deactivate();
-                    vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders.length : 0, null, {name: obj.title.replace(/^.*: */, ""), uri: vscode.Uri.parse(`craftos-pc://${obj.id}/`)});
-                } else {
-                    vscode.window.showInputBox({prompt: "Enter the window ID:", validateInput: str => isNaN(parseInt(str)) ? "Invalid number" : null}).then(value => {
-                        if (typeof windows[value] !== "object") vscode.window.showErrorMessage("The window ID provided does not exist.");
-                        else vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders.length : 0, null, {name: windows[value].title.replace(/^.*: */, ""), uri: vscode.Uri.parse(`craftos-pc://${value}/`)});
-                    });
-                }
-            });
-            return;
         }
-        if (typeof obj === "object") {
-            vscode.window.showInformationMessage("A workspace is already open; the files have been added to the current workspace.");
-            vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders.length : 0, null, {name: obj.title.replace(/^.*: */, ""), uri: vscode.Uri.parse(`craftos-pc://${obj.id}/`)});
+        let id, title;
+        if (obj !== null && typeof obj === "object") {
+            id = String(obj.id);
+            title = obj.title;
         } else {
-            vscode.window.showInputBox({prompt: "Enter the window ID:", validateInput: str => isNaN(parseInt(str)) ? "Invalid number" : null}).then(value => {
-                if (typeof windows[value] !== "object") vscode.window.showErrorMessage("The window ID provided does not exist.");
-                else vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders.length : 0, null, {name: windows[value].title.replace(/^.*: */, ""), uri: vscode.Uri.parse(`craftos-pc://${value}/`)});
-            });
+            const value = await vscode.window.showInputBox({prompt: "Enter the window ID:", validateInput: str => isNaN(parseInt(str)) ? "Invalid number" : null});
+            if (value === undefined) return;
+            id = String(parseInt(value));
+            if (typeof windows[id] !== "object") {
+                vscode.window.showErrorMessage("The window ID provided does not exist.");
+                return;
+            }
+            title = windows[id].term && windows[id].term.title;
+        }
+        if (!vscode.workspace.workspaceFile) {
+            // Adding a folder to a window without a workspace restarts the extension host, which closes the connection.
+            const opt = await vscode.window.showWarningMessage("Due to technical limitations, opening the computer data will cause the connection to close. Please restart the connection after running this. Are you sure you want to continue?", "No", "Yes");
+            if (opt !== "Yes") return; // "No" or dialog dismissed
+            deactivate();
+            addRemoteFolder(id, title);
+        } else {
+            const result = addRemoteFolder(id, title);
+            if (result === "exists") vscode.window.showInformationMessage("The data of this computer is already in the workspace.");
+            else if (result) vscode.window.showInformationMessage("A workspace is already open; the files have been added to the current workspace.");
+            else vscode.window.showErrorMessage("Could not add the computer's files to the workspace.");
         }
     }));
 
@@ -1023,28 +1189,36 @@ function activate(context) {
             vscode.window.showErrorMessage("Please open CraftOS-PC before using this command.");
             return;
         }
-        process_connection.stdin.write(useBinaryChecksum ? "!CPC000CBAACAAAAAAAA2C7A548B\n" : "!CPC000CBAACAAAAAAAA3AB9B910\n", "utf8");
-        process_connection.kill(SIGINT);
-        process_connection = null;
+        closeConnection();
     }));
 
-    context.subscriptions.push(vscode.commands.registerCommand("craftos-pc.run-file", path => {
-        if (process_connection === null) {
-            if (!path) {
-                if (vscode.window.activeTextEditor === undefined || vscode.window.activeTextEditor.document.uri.scheme !== "file") {
-                    vscode.window.showErrorMessage("Please open or save a file on disk before using this command.");
-                    return;
-                }
-                path = vscode.window.activeTextEditor.document.uri.fsPath;
-            } else if (typeof path === "object" && path instanceof vscode.Uri) {
-                if (path.scheme !== "file") {
-                    vscode.window.showErrorMessage("Please open or save a file on disk before using this command.");
-                    return;
-                }
-                path = path.fsPath;
+    context.subscriptions.push(vscode.commands.registerCommand("craftos-pc.run-file", async path => {
+        if (!path) {
+            if (vscode.window.activeTextEditor === undefined || vscode.window.activeTextEditor.document.uri.scheme !== "file") {
+                vscode.window.showErrorMessage("Please open or save a file on disk before using this command.");
+                return;
             }
-            return connectToProcess(["--script", path]);
-        } else vscode.window.showErrorMessage("Please close CraftOS-PC before using this command.");
+            path = vscode.window.activeTextEditor.document.uri.fsPath;
+        } else if (typeof path === "object" && path instanceof vscode.Uri) {
+            if (path.scheme !== "file") {
+                vscode.window.showErrorMessage("Please open or save a file on disk before using this command.");
+                return;
+            }
+            path = path.fsPath;
+        }
+        if (process_connection !== null) {
+            const mode = vscode.workspace.getConfiguration("craftos-pc").get("closeOldTerminalOnRun") || "ask";
+            if (mode === "never") {
+                vscode.window.showErrorMessage("Please close CraftOS-PC before using this command.");
+                return;
+            }
+            if (mode === "ask") {
+                const opt = await vscode.window.showWarningMessage("CraftOS-PC is already running. Close the old terminal and run this file?", "Close and Run");
+                if (opt !== "Close and Run") return;
+            }
+            closeConnection();
+        }
+        return connectToProcess(["--script", path]);
     }));
 
     context.subscriptions.push(vscode.workspace.registerFileSystemProvider("craftos-pc", new RawFileSystemProvider()));
@@ -1104,6 +1278,7 @@ function activate(context) {
                         monitor_provider._onDidChangeTreeData.fire(null);
                     });
                     vslsClient.onNotify("term", param => {
+                        if (!windows[param.id]) return;
                         windows[param.id].term = param.term
                         if (windows[param.id].panel) {
                             windows[param.id].panel.webview.postMessage(param.term);

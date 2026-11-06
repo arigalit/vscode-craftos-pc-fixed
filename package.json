@@ -1,8 +1,8 @@
 {
-	"name": "craftos-pc",
-	"displayName": "CraftOS-PC for VS Code",
-	"description": "Adds the ability to open CraftOS-PC windows inside VS Code, as well as some ease-of-use functionality to make ComputerCraft programming easier.",
-	"version": "1.2.3",
+	"name": "craftos-pc-fixed",
+	"displayName": "CraftOS-PC for VS Code (Fixed)",
+	"description": "Maintained fork of CraftOS-PC for VS Code with fixes for unstable remote file access, large-screen mouse clicks and more.",
+	"version": "1.2.4",
 	"engines": {
 		"vscode": "^1.41.0"
 	},
@@ -16,12 +16,12 @@
 		"craftos-pc"
 	],
 	"author": {
-		"name": "JackMacWindows"
+		"name": "JackMacWindows (original), arigalit (fork)"
 	},
-	"publisher": "JackMacWindows",
+	"publisher": "arigalit",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/MCJack123/vscode-craftos-pc"
+		"url": "https://github.com/arigalit/vscode-craftos-pc-fixed.git"
 	},
 	"icon": "media/icon.png",
 	"activationEvents": [
@@ -202,6 +202,14 @@
 					"type": "string",
 					"default": null,
 					"description": "The path to the data directory to use for CraftOS-PC. This defaults to the standard data directory location.",
+					"scope": "window"
+				},
+				"craftos-pc.closeOldTerminalOnRun": {
+					"type": "string",
+					"enum": ["ask", "always", "never"],
+					"enumDescriptions": ["Ask before closing the running CraftOS-PC terminal.", "Always close the running terminal and start the new script.", "Never close it; show an error instead."],
+					"default": "ask",
+					"description": "What to do when running a file while CraftOS-PC is already open.",
 					"scope": "window"
 				},
 				"craftos-pc.additionalArguments": {

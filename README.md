@@ -1,4 +1,10 @@
-# CraftOS-PC for VS Code README
+# CraftOS-PC for VS Code (Fixed) README
+
+> **This is a fork of [MCJack123/vscode-craftos-pc](https://github.com/MCJack123/vscode-craftos-pc)**, the original extension, which is no longer maintained. This fork fixes its problems, mainly the unreliable remote file system connection, wrong mouse positions on big screens and several crashes. See the [changelog](CHANGELOG.md) for the full list.
+>
+> **Important:** this fork uses the same command and setting IDs (`craftos-pc.*`) as the original. Uninstall the original "CraftOS-PC for VS Code" before installing this one, and turn off auto-update for it, otherwise the two will conflict.
+>
+> All credit for the original work goes to JackMacWindows. See `LICENSE`.
 
 An extension for Visual Studio Code adding a bunch of new features to help you write ComputerCraft code easier through CraftOS-PC.
 
@@ -35,6 +41,7 @@ This extension contributes the following settings:
 
 * `craftos-pc.executablePath.[windows|mac|linux|all]`: Path to the CraftOS-PC executable depending on the platform. This should be an absolute path to an executable supporting console output (on Windows, this must be pointing to a copy of `CraftOS-PC_console.exe`, which is optionally available in the installer).
 * `craftos-pc.dataPath`: Path to the data directory storing computer files, configuration, etc.
+* `craftos-pc.closeOldTerminalOnRun`: What to do when running a script while a CraftOS-PC terminal is already open: `ask` (default), `always` close it, or `never`.
 * `craftos-pc.additionalArguments`: Additional command-line arguments to send to CraftOS-PC, separated by spaces.
 * `craftos-pc.customFont.path`: The path to a custom font, if desired. Must be a path to a valid image, or 'hdfont' to automatically find the HD font. Unlike normal CraftOS-PC, this may point to non-BMP files as well.
 
@@ -42,6 +49,8 @@ This extension contributes the following settings:
 
 * Occasionally, keyboard input may stop working. To fix this, click outside the CraftOS-PC window and then back in.
 * Scroll events do not report the position of the scroll. This is a limitation of JavaScript.
+* Scrolling up may report `0` instead of `-1`. This is a bug in CraftOS-PC itself, not in this extension.
+* Breakpoints may show as "unverified" if the debugger attaches late. This is handled by CraftOS-PC; adding a short `os.sleep` at the start of the script works around it.
 * Live Share support does not respect read-only mode due to a limitation in the Live Share API.
 * Some versions of CraftOS-PC have bugs that interfere with the functioning of this extension:
   * The debugger only works on CraftOS-PC v2.7 or later.
@@ -69,6 +78,10 @@ To fix this, create a file called `.vs-liveshare-settings.json` in your home fol
 Then reload VS Code and run Live Share again.
 
 ## Release Notes
+
+## 1.2.4 (Fixed fork)
+
+* First release of the fork: reliable remote file access, correct mouse positions, UTF-8 file names, new `closeOldTerminalOnRun` setting and many crash fixes. See [CHANGELOG.md](CHANGELOG.md).
 
 ## 1.2.3
 
